@@ -1,4 +1,4 @@
-﻿using Blizzard.GameService.SDK.Client.Integration;
+using Blizzard.GameService.SDK.Client.Integration;
 using Blizzard.T5.Core;
 using Blizzard.T5.Core.Time;
 using HarmonyLib;
@@ -2218,23 +2218,691 @@ namespace HsMod
 
         public class PatchFavorite
         {
+            private const int FakePetEntityIdBase = 900000;
+            private const string BoardPetActorPath = "Card_Pet.prefab:42b6fce151aab234fbfbc0391c5bbe9d";
+            private static readonly HashSet<int> loggedInvalidPetVariants = new HashSet<int>();
+            private static readonly Dictionary<int, int> loadedFakePetVariants = new Dictionary<int, int>();
+
+            private static bool TryGetConfiguredPetVariant(Player.Side side, out int petVariantId)
+            {
+                petVariantId = side == Player.Side.FRIENDLY ? skinPet.Value : skinOpposingPet.Value;
+                return petVariantId != -1;
+            }
+
+            private static bool TryGetPetVariantRecord(int petVariantId, out PetVariantDbfRecord petVariantRecord)
+            {
+                petVariantRecord = null;
+
+                if (petVariantId <= 0)
+                {
+                    return false;
+                }
+
+                petVariantRecord = GameDbf.PetVariant.GetRecord(petVariantId);
+                if (petVariantRecord != null)
+                {
+                    return true;
+                }
+
+                if (!loggedInvalidPetVariants.Contains(petVariantId))
+                {
+                    loggedInvalidPetVariants.Add(petVariantId);
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Warning, $"Invalid pet variant id: {petVariantId}");
+                }
+                return false;
+            }
+
+            private static string GetPetFaceCardId(PetVariantDbfRecord petVariantRecord)
+            {
+                if (petVariantRecord == null || petVariantRecord.CardId <= 0)
+                {
+                    return null;
+                }
+                return GameUtils.TranslateDbIdToCardId(petVariantRecord.CardId);
+            }
+
+            private static void ApplyPetSkinToPlayer(Player player, int petVariantId)
+            {
+                if (player == null)
+                {
+                    return;
+                }
+
+                if (petVariantId == 0)
+                {
+                    player.SetTag(GAME_TAG.PET_ID, 0);
+                    player.SetTag(GAME_TAG.PET_VARIANT_ID, 0);
+                    return;
+                }
+
+                if (!TryGetPetVariantRecord(petVariantId, out PetVariantDbfRecord petVariantRecord))
+                {
+                    return;
+                }
+
+                string faceCardId = GetPetFaceCardId(petVariantRecord);
+                player.SetTag(GAME_TAG.PET_ID, petVariantRecord.PetId);
+                player.SetTag(GAME_TAG.PET_VARIANT_ID, petVariantId);
+
+                Entity pet = player.GetPet();
+                if (pet == null)
+                {
+                    pet = CreatePetFaceCardEntity(player, petVariantRecord, petVariantId, faceCardId);
+                }
+                else
+                {
+                    ApplyPetFaceCard(pet, petVariantRecord, petVariantId, faceCardId);
+                }
+
+                PetController petController = player.GetPetController();
+                if (petController != null && !string.IsNullOrEmpty(faceCardId))
+                {
+                    petController.SetPet(faceCardId, true);
+                }
+            }
+
+            private static int GetFakePetEntityId(Player player)
+            {
+                return FakePetEntityIdBase + player.GetPlayerId();
+            }
+
+            private static int GetFakePetEntityId(int playerId)
+            {
+                return FakePetEntityIdBase + playerId;
+            }
+
+            private static Entity CreatePetFaceCardEntity(Player player, PetVariantDbfRecord petVariantRecord, int petVariantId, string faceCardId)
+            {
+                if (player == null || petVariantRecord == null || string.IsNullOrEmpty(faceCardId))
+                {
+                    return null;
+                }
+
+                GameState gameState = GameState.Get();
+                if (gameState == null)
+                {
+                    return null;
+                }
+
+                int fakeEntityId = GetFakePetEntityId(player);
+                Entity petEntity = gameState.GetEntity(fakeEntityId);
+                if (petEntity == null)
+                {
+                    petEntity = new Entity();
+                    petEntity.SetTag(GAME_TAG.ENTITY_ID, fakeEntityId);
+                    petEntity.SetTag(GAME_TAG.CONTROLLER, player.GetPlayerId());
+                    petEntity.SetTag(GAME_TAG.CARDTYPE, TAG_CARDTYPE.PET);
+                    petEntity.SetTag(GAME_TAG.ZONE_POSITION, 0);
+                    gameState.AddEntity(petEntity);
+                    petEntity.InitCard();
+                }
+
+                ApplyPetFaceCard(petEntity, petVariantRecord, petVariantId, faceCardId);
+                petEntity.SetTag(GAME_TAG.ENTITY_ID, fakeEntityId);
+                petEntity.SetTag(GAME_TAG.CONTROLLER, player.GetPlayerId());
+                petEntity.SetTagAndHandleChange(GAME_TAG.ZONE, TAG_ZONE.COSMETIC);
+
+                player.SetPet(petEntity);
+                player.SetTag(GAME_TAG.PET_ENTITY, fakeEntityId);
+                AttachPetCardToCosmeticZone(player, petEntity);
+
+                bool shouldReloadPet = !loadedFakePetVariants.TryGetValue(fakeEntityId, out int loadedPetVariantId)
+                    || loadedPetVariantId != petVariantId
+                    || petEntity.GetPetController() == null;
+                if (shouldReloadPet)
+                {
+                    Entity.LoadCardData loadCardData = new Entity.LoadCardData
+                    {
+                        updateActor = true,
+                        restartStateSpells = true,
+                        fromChangeEntity = true
+                    };
+                    petEntity.LoadCard(faceCardId, loadCardData, false);
+                    UpdateFakePetActor(player, petEntity, faceCardId, petVariantId);
+                    loadedFakePetVariants[fakeEntityId] = petVariantId;
+                }
+                else
+                {
+                    AttachPetCardToCosmeticZone(player, petEntity);
+                    PetController existingController = petEntity.GetPetController();
+                    if (existingController != null)
+                    {
+                        existingController.SetPet(faceCardId, true);
+                        RegisterFakePetWithGameplay(petEntity, faceCardId, petVariantId);
+                    }
+                }
+
+                return petEntity;
+            }
+
+            private static void AttachPetCardToCosmeticZone(Player player, Entity petEntity)
+            {
+                if (player == null || petEntity == null || petEntity.GetCard() == null)
+                {
+                    return;
+                }
+
+                ZoneMgr zoneMgr = ZoneMgr.Get();
+                if (zoneMgr == null)
+                {
+                    return;
+                }
+
+                Zone zone = zoneMgr.FindZoneOfType<ZoneCosmetic>(player.GetSide());
+                if (zone == null)
+                {
+                    zone = zoneMgr.FindZoneForEntityAndZoneTag(petEntity, TAG_ZONE.COSMETIC);
+                }
+                if (zone == null)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Warning, $"Fake pet cosmetic zone not found for player {player.GetPlayerId()}");
+                    return;
+                }
+
+                Card card = petEntity.GetCard();
+                if (!zone.ContainsCard(card))
+                {
+                    zone.AddCard(card);
+                }
+                card.SetZone(zone);
+                card.SetZonePosition(0);
+
+                PetControllerBoard petController = petEntity.GetPetController() as PetControllerBoard;
+                if (petController != null && IsFakePetController(petController))
+                {
+                    Transform petRoot = zone.GetZoneTransformForCard(card);
+                    if (petRoot != null)
+                    {
+                        petController.SetPetRoot(petRoot);
+                    }
+
+                    GameObject petObject = petController.PetObject;
+                    if (petObject != null && petRoot != null)
+                    {
+                        petObject.transform.SetParent(petRoot, false);
+                        petObject.transform.localPosition = Vector3.zero;
+                        petObject.transform.localRotation = Quaternion.identity;
+                        petObject.transform.localScale = Vector3.one;
+                    }
+                    FixFakePetItemPositions(petController);
+                }
+
+                zone.DirtyLayout();
+                zone.UpdateLayout();
+            }
+
+            private static void UpdateFakePetActor(Player player, Entity petEntity, string faceCardId, int petVariantId)
+            {
+                Card petCard = petEntity?.GetCard();
+                if (petCard == null)
+                {
+                    return;
+                }
+
+                petCard.UpdateActor(true);
+                Actor actor = petCard.GetActor();
+                if (actor == null)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Warning, $"Fake pet actor was not created for pet variant {petVariantId} ({faceCardId})");
+                    return;
+                }
+
+                PetController petController = petEntity.GetPetController();
+                if (petController == null)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Warning, $"Fake pet actor has no PetController for pet variant {petVariantId} ({faceCardId})");
+                    return;
+                }
+
+                petController.SetPet(faceCardId, true);
+                actor.Show();
+
+                // Wait for PetObject to be created
+                petCard.StartCoroutine(WaitForPetObjectThenAttach(player, petEntity, faceCardId, petVariantId));
+            }
+
+            private static IEnumerator WaitForPetObjectThenAttach(Player player, Entity petEntity, string faceCardId, int petVariantId)
+            {
+                PetController petController = petEntity.GetPetController();
+                int maxWait = 60;
+                while (maxWait > 0 && (petController == null || petController.PetObject == null))
+                {
+                    yield return null;
+                    maxWait--;
+                    petController = petEntity.GetPetController();
+                }
+
+                if (petController != null && petController.PetObject != null)
+                {
+                    AttachPetCardToCosmeticZone(player, petEntity);
+                    RegisterFakePetWithGameplay(petEntity, faceCardId, petVariantId);
+                    FixFakePetItemPositions(petController as PetControllerBoard);
+                }
+                else
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Warning, $"PetObject not created after 60 frames");
+                }
+            }
+
+            private static ZoneCosmetic GetFakePetCosmeticZone(PetControllerBoard petController)
+            {
+                Entity petEntity = petController?.GetEntity();
+                ZoneCosmetic zone = petEntity?.GetCard()?.GetZone() as ZoneCosmetic;
+                if (zone != null)
+                {
+                    return zone;
+                }
+
+                Player owner = petController?.GetOwner();
+                ZoneMgr zoneMgr = ZoneMgr.Get();
+                if (owner != null && zoneMgr != null)
+                {
+                    return zoneMgr.FindZoneOfType<ZoneCosmetic>(owner.GetSide());
+                }
+                return null;
+            }
+
+            private static Transform GetFakePetItemRoot(PetControllerBoard petController, string assetPath)
+            {
+                ZoneCosmetic zone = GetFakePetCosmeticZone(petController);
+                if (zone == null)
+                {
+                    return null;
+                }
+
+                PetDataHandlerGameplay dataHandler = petController?.DataHandler;
+                if (dataHandler != null)
+                {
+                    string toyAssetPath = dataHandler.GetToyAssetPath();
+                    if (!string.IsNullOrEmpty(toyAssetPath) && assetPath == toyAssetPath)
+                    {
+                        return zone.ToyPosition ?? zone.PetPosition;
+                    }
+
+                    string treatAssetPath = dataHandler.GetTreatAssetPath();
+                    if (!string.IsNullOrEmpty(treatAssetPath) && assetPath == treatAssetPath)
+                    {
+                        return zone.TreatPosition ?? zone.PetPosition;
+                    }
+                }
+
+                return zone.ToyPosition ?? zone.PetPosition;
+            }
+
+            private static void MoveFakePetItem(PetItem item, Transform root)
+            {
+                if (item == null || root == null)
+                {
+                    return;
+                }
+
+                item.transform.SetPositionAndRotation(root.position, root.rotation);
+            }
+
+            private static void FixFakePetItemPositions(PetControllerBoard petController)
+            {
+                if (!IsFakePetController(petController))
+                {
+                    return;
+                }
+
+                ZoneCosmetic zone = GetFakePetCosmeticZone(petController);
+                if (zone == null)
+                {
+                    return;
+                }
+
+                MoveFakePetItem(petController.Toy, zone.ToyPosition ?? zone.PetPosition);
+                MoveFakePetItem(petController.Treat, zone.TreatPosition ?? zone.PetPosition);
+            }
+
+            private static void RegisterFakePetWithGameplay(Entity petEntity, string faceCardId, int petVariantId)
+            {
+                PetController petController = petEntity?.GetPetController();
+                PetControllerGame gamePetController = petController as PetControllerGame;
+                if (gamePetController == null)
+                {
+                    string controllerType = petController == null ? "null" : petController.GetType().FullName;
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Warning, $"Fake pet has no PetControllerGame for pet variant {petVariantId} ({faceCardId}); controller={controllerType}");
+                    return;
+                }
+
+                PetGameplayManager petGameplayManager = PetGameplayManager.Get();
+                if (petGameplayManager == null)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Warning, $"PetGameplayManager not found for fake pet variant {petVariantId} ({faceCardId})");
+                    return;
+                }
+
+                petGameplayManager.RegisterPet(gamePetController);
+            }
+
+            private static bool IsFakePetController(PetControllerBoard petController)
+            {
+                if (petController == null)
+                {
+                    return false;
+                }
+
+                GameState gameState = GameState.Get();
+                if (gameState == null)
+                {
+                    return false;
+                }
+
+                Entity fakePet = gameState.GetEntity(GetFakePetEntityId(petController.PlayerId));
+                return fakePet != null && fakePet.GetPetController() == petController;
+            }
+
+            private static void DispatchFakePetEvent(Player player, PetEventType petEventType)
+            {
+                if (player == null || petEventType == PetEventType.INVALID)
+                {
+                    return;
+                }
+
+                GameState gameState = GameState.Get();
+                Entity fakePet = gameState?.GetEntity(GetFakePetEntityId(player.GetPlayerId()));
+                PetControllerGame petController = fakePet?.GetPetController() as PetControllerGame;
+                petController?.HandleEvent(petEventType);
+            }
+
+            private static void DispatchFakePetEvent(Entity sourceEntity, PetEventType friendlyEvent, PetEventType opposingEvent)
+            {
+                Player player = sourceEntity?.GetController();
+                if (player == null)
+                {
+                    return;
+                }
+
+                DispatchFakePetEvent(player, player.GetSide() == Player.Side.FRIENDLY ? friendlyEvent : opposingEvent);
+            }
+
+            private static int GetEntityCost(Entity entity)
+            {
+                return entity == null ? 0 : entity.GetTag(GAME_TAG.COST);
+            }
+
+            private static PetEventType GetMinionPlayedEvent(Entity minion)
+            {
+                bool friendly = minion.GetControllerSide() == Player.Side.FRIENDLY;
+                int cost = GetEntityCost(minion);
+                if (cost <= 3)
+                {
+                    return friendly ? PetEventType.FRIENDLY_MINIONPLAYED_MANAVALUE_3ORLESS : PetEventType.OPPONENT_MINIONPLAYED_MANAVALUE_3ORLESS;
+                }
+                if (cost <= 6)
+                {
+                    return friendly ? PetEventType.FRIENDLY_MINIONPLAYED_MANAVALUE_4TO6 : PetEventType.OPPONENT_MINIONPLAYED_MANAVALUE_4TO6;
+                }
+                return friendly ? PetEventType.FRIENDLY_MINIONPLAYED_MANAVALUE_7PLUS : PetEventType.OPPONENT_MINIONPLAYED_MANAVALUE_7PLUS;
+            }
+
+            private static PetEventType GetSpellCastEvent(Entity spell)
+            {
+                bool friendly = spell.GetControllerSide() == Player.Side.FRIENDLY;
+                int cost = GetEntityCost(spell);
+                if (cost <= 3)
+                {
+                    return friendly ? PetEventType.FRIENDLY_SPELLCAST_MANAVALUE_3ORLESS : PetEventType.OPPONENT_SPELLCAST_MANAVALUE_3ORLESS;
+                }
+                return friendly ? PetEventType.FRIENDLY_SPELLCAST_MANAVALUE_4PLUS : PetEventType.OPPONENENT_SPELLCAST_MANAVALUE_4PLUS;
+            }
+
+            private static PetEventType GetEmotePetEvent(EmoteType emoteType)
+            {
+                switch (emoteType)
+                {
+                    case EmoteType.GREETINGS:
+                    case EmoteType.MIRROR_GREETINGS:
+                        return PetEventType.EMOTE_GREETINGS;
+                    case EmoteType.WELL_PLAYED:
+                    case EmoteType.GOOD_GAME:
+                        return PetEventType.EMOTE_WELLPLAYED;
+                    case EmoteType.THANKS:
+                        return PetEventType.EMOTE_THANKS;
+                    case EmoteType.WOW:
+                        return PetEventType.EMOTE_WOW;
+                    case EmoteType.OOPS:
+                    case EmoteType.SORRY:
+                        return PetEventType.EMOTE_OOPS;
+                    case EmoteType.THREATEN:
+                        return PetEventType.EMOTE_THREATEN;
+                    case EmoteType.CONCEDE:
+                        return PetEventType.EMOTE_CONCEDE;
+                    default:
+                        return PetEventType.INVALID;
+                }
+            }
+
+            private static void ApplyPetFaceCard(Entity petEntity, PetVariantDbfRecord petVariantRecord, int petVariantId, string faceCardId = null)
+            {
+                if (petEntity == null || petVariantRecord == null)
+                {
+                    return;
+                }
+
+                petEntity.SetTag(GAME_TAG.PET_ID, petVariantRecord.PetId);
+                petEntity.SetTag(GAME_TAG.PET_VARIANT_ID, petVariantId);
+                petEntity.SetTag(GAME_TAG.CARDTYPE, TAG_CARDTYPE.PET);
+
+                if (!string.IsNullOrEmpty(faceCardId))
+                {
+                    petEntity.SetCardId(faceCardId);
+                }
+            }
+
             [HarmonyPrefix]
             [HarmonyPatch(typeof(CornerSpellReplacementManager), "UpdateCornerReplacements")]
             private static void PatchUpdateCornerReplacements(ref CornerReplacementContext friendlyNewContext)
             {
                 try
                 {
-                    if (skinPet.Value != -1)
+                    ApplyPetSkinToPlayer(GameState.Get()?.GetPlayerBySide(Player.Side.FRIENDLY), skinPet.Value);
+                    ApplyPetSkinToPlayer(GameState.Get()?.GetPlayerBySide(Player.Side.OPPOSING), skinOpposingPet.Value);
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPrefix]
+            [HarmonyPatch(typeof(Actor), "UpdatePetComponents")]
+            public static void PatchUpdatePetComponents(Actor __instance)
+            {
+                try
+                {
+                    Entity petEntity = __instance?.GetCard()?.GetEntity();
+                    if (petEntity == null || !petEntity.IsPet())
                     {
-                        Player playerBySide2 = GameState.Get()?.GetPlayerBySide(Player.Side.FRIENDLY);
-                        playerBySide2?.SetTag(GAME_TAG.PET_VARIANT_ID, 0);
+                        return;
                     }
 
-                    if (skinOpposingPet.Value != -1)
+                    if (!TryGetConfiguredPetVariant(petEntity.GetControllerSide(), out int petVariantId))
                     {
-                        Player playerBySide2 = GameState.Get()?.GetPlayerBySide(Player.Side.OPPOSING);
-                        playerBySide2?.SetTag(GAME_TAG.PET_VARIANT_ID, 0);
+                        return;
                     }
+
+                    if (TryGetPetVariantRecord(petVariantId, out PetVariantDbfRecord petVariantRecord))
+                    {
+                        ApplyPetFaceCard(petEntity, petVariantRecord, petVariantId, GetPetFaceCardId(petVariantRecord));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPrefix]
+            [HarmonyPatch(typeof(PetControllerBoard), "InitializeEmote")]
+            public static bool PatchInitializeEmote(PetControllerBoard __instance)
+            {
+                try
+                {
+                    if (!IsFakePetController(__instance))
+                    {
+                        return true;
+                    }
+
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                    return true;
+                }
+            }
+
+            [HarmonyPrefix]
+            [HarmonyPatch(typeof(PetControllerBoard), "InstantiateItem")]
+            public static void PatchInstantiateItemPosition(PetControllerBoard __instance, string assetPath, ref Vector3 position, ref Quaternion rotation)
+            {
+                try
+                {
+                    if (!IsFakePetController(__instance))
+                    {
+                        return;
+                    }
+
+                    Transform itemRoot = GetFakePetItemRoot(__instance, assetPath);
+                    if (itemRoot == null)
+                    {
+                        return;
+                    }
+
+                    position = itemRoot.position;
+                    rotation = itemRoot.rotation;
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(PetControllerBoard), "InstantiateItem")]
+            public static void PatchInstantiateItemResult(PetControllerBoard __instance, string assetPath, PetItem __result)
+            {
+                try
+                {
+                    if (!IsFakePetController(__instance))
+                    {
+                        return;
+                    }
+
+                    MoveFakePetItem(__result, GetFakePetItemRoot(__instance, assetPath));
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(Card), "NotifyOfSpellPlayed")]
+            public static void PatchNotifyOfSpellPlayed(Entity source)
+            {
+                try
+                {
+                    if (source != null)
+                    {
+                        DispatchFakePetEvent(source.GetController(), GetSpellCastEvent(source));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(Card), "NotifyOfWeaponPlayed")]
+            public static void PatchNotifyOfWeaponPlayed(Entity source)
+            {
+                try
+                {
+                    DispatchFakePetEvent(source, PetEventType.FRIENDLY_WEAPONEQUIPPED, PetEventType.OPPONENT_WEAPONEQUIPPED);
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(Card), "NotifyOfHeroPowerPlayed")]
+            public static void PatchNotifyOfHeroPowerPlayed(Entity source)
+            {
+                try
+                {
+                    DispatchFakePetEvent(source, PetEventType.FRIENDLY_HEROPOWER, PetEventType.OPPONENT_HEROPOWER);
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(Card), "ActivateCharacterPlayEffects")]
+            public static void PatchActivateCharacterPlayEffects(Card __instance)
+            {
+                try
+                {
+                    Entity entity = __instance?.GetEntity();
+                    if (entity != null && entity.IsMinion())
+                    {
+                        DispatchFakePetEvent(entity.GetController(), GetMinionPlayedEvent(entity));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(GameState), "OnCurrentPlayerChanged")]
+            public static void PatchOnCurrentPlayerChanged(Player player)
+            {
+                try
+                {
+                    if (player == null)
+                    {
+                        return;
+                    }
+
+                    DispatchFakePetEvent(player, player.GetSide() == Player.Side.FRIENDLY ? PetEventType.FRIENDLY_TURN_START : PetEventType.OPPONENT_TURN_START);
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(Card), "PlayEmote", new Type[] { typeof(EmoteType) })]
+            public static void PatchPlayEmote(Card __instance, EmoteType emoteType)
+            {
+                try
+                {
+                    DispatchFakePetEvent(__instance?.GetController(), GetEmotePetEvent(emoteType));
+                }
+                catch (Exception ex)
+                {
+                    Utils.MyLogger(BepInEx.Logging.LogLevel.Error, ex);
+                }
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPatch(typeof(Card), "PlayEmote", new Type[] { typeof(EmoteType), typeof(Notification.SpeechBubbleDirection), typeof(bool) })]
+            public static void PatchPlayEmoteWithBubble(Card __instance, EmoteType emoteType)
+            {
+                try
+                {
+                    DispatchFakePetEvent(__instance?.GetController(), GetEmotePetEvent(emoteType));
                 }
                 catch (Exception ex)
                 {
@@ -3798,4 +4466,3 @@ namespace HsMod
     }
 
 }
-
