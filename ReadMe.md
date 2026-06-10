@@ -1,5 +1,6 @@
 # HsMod
-
+本项目在原项目的基础上添加了适用于无宠物换肤的功能,直接在网页管理器上设置你想选用的宠物id即可。
+This project adds pet replacement functionality on top of the original project. Simply set your desired pet ID in the web manager.
  **H**earth**s**tone **Mod**ification Based on BepInEx, the plugin source code is located at [github](https://github.com/Pik-4/HsMod)[.](https://github.com/Pik-4/HsMod)[com](https://github.com/Pik-4/HsMod)[/](https://github.com/Pik-4/HsMod)[Pik](https://github.com/Pik-4/HsMod)[-](https://github.com/Pik-4/HsMod)[4](https://github.com/Pik-4/HsMod)[/](https://github.com/Pik-4/HsMod)[HsMod](https://github.com/Pik-4/HsMod), the plugin will not collect any information about you; the project follows `AGPL-3.0`, and is used for learning and research only.
 
 HsMod plans to develop web-based configuration management. If you are interested, you can check [#122](https://github.com/Pik-4/HsMod/discussions/122)
