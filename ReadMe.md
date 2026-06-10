@@ -67,6 +67,7 @@ Note: (1) The plugin is currently not fully translated. (2) In order to reduce t
 53. ~~Allow lifting the set recognition restriction to open Manning Hearthstone.~~ Has been fixed by Blizzard.
 54. ~~Zero-Dollor Shopping~~ Has been fixed by Blizzard.
 55. Attempt to disable anti-cheat.
+56. Support pet skin replacement through a locally built pet face card, so the configured pet skin can be displayed even when the account does not own or equip a pet.
 
 ### Installation Instructions 
 
@@ -199,6 +200,38 @@ Now the game needs to be launched only through `./run_bepinex.sh TOKEN`  or  `./
 
 15. Execute `./run_bepinex.sh` and enjoy Hearthstone.
 
+### Pet facecard skin
+
+This fork keeps the original pet skin configuration behavior and adds a fallback for accounts without a pet. When `skinPet` or `skinOpposingPet` is set to a valid pet variant id but the corresponding player has no pet entity, HsMod creates a local pet face card and attaches the pet model, interaction input, reactions, toy, and treat to the normal pet corner.
+
+Configuration entries:
+
+```ini
+skinPet = -1
+skinOpposingPet = -1
+```
+
+Value meanings:
+
+```text
+-1  Do not modify this side's pet.
+ 0  Hide this side's pet.
+>0  Use this PetVariant id.
+```
+
+Usage:
+
+1. Put the compiled `HsMod.dll` into `Hearthstone\BepInEx\plugins`.
+2. Start Hearthstone once and let HsMod create or update the configuration files.
+3. Set `skinPet` in `Hearthstone\BepInEx\config\HsSkins.cfg` to the pet variant id you want. Set `skinOpposingPet` only if you also want to replace the opponent side.
+4. Press `F4` to reload skin settings, then start or reconnect to a match. Starting a new match is the most reliable way to refresh pet objects.
+
+Notes:
+
+- Existing real pets still use the normal HsMod pet skin path; the fake face card path is used only when the player has no pet entity.
+- Pet reactions are dispatched locally for common game actions such as turn start, card play, hero power, weapon equip, and emotes.
+- If the model, toy, or interaction is misplaced, check `Hearthstone\BepInEx\LogOutput.log` and `Hearthstone\BepInEx\config\HsSkins.cfg` first.
+
 ### Version Description
 
 As in HsMod version `3.0.0.0`:
@@ -227,6 +260,7 @@ Hearthstone version update does not necessarily cause HsMod to fail, if HsMod pl
 10. If the skin display is abnormal, please check `HsSkins.cfg` and try to delete `HsMod.cfg` to re-configure it.
 11. If the modified settings can not be saved, please check if other Hearthstone plugins are enabled.
 12. For BepInEx, please choose **BepInEx 5**. Since BepInEx 6 is still in pre-release, it will not be adapted for now.
+13. For pet facecard skin issues, confirm that `skinPet` or `skinOpposingPet` is a `PetVariant` id rather than a normal card dbid. The plugin log is usually located at `Hearthstone\BepInEx\LogOutput.log`.
 
 ### client.config
 
@@ -280,4 +314,3 @@ Telegram @HearthstoneMod (**Suggest and Recommend**)
 6. [Harmony](https://harmony.pardeike.net/articles/intro.html)
 7. [List of CIL instructions](https://en.wikipedia.org/wiki/List_of_CIL_instructions)
 8. [hearthstone-linux](https://github.com/0xf4b1/hearthstone-linux)
-
